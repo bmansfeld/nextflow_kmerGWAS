@@ -42,8 +42,8 @@ ml apptainer
 
 ```bash
 cd /storage1/fs1/<PI_NAME>/Active/<YOUR_PROJECT>
-git clone <repository_url> kmers_gwas_pipeline
-cd kmers_gwas_pipeline
+git clone bmansfeld/nextflow_kmerGWAS
+cd nextflow_kmerGWAS
 ```
 
 ### 3. Verify Files
