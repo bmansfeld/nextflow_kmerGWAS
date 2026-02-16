@@ -1,163 +1,90 @@
 #!/usr/bin/env nextflow
 
 /*
-========================================================================================
-   K-MERS GWAS PIPELINE
-========================================================================================
-   Simple single-file pipeline for k-mers based GWAS
-   Supports both Paired-End (PE) and Single-End (SE) reads
-   
-   Author: Built for Mansfeld Lab
-   Version: 1.1
-========================================================================================
+ K-MERS GWAS PIPELINE - CHUNK 2 (with resource allocations)
+ Handles multiple lanes per sample + k-mer counting
 */
 
 nextflow.enable.dsl=2
 
-// ========================================================================================
-// PARAMETERS
-// ========================================================================================
-
-params.samples = null          // TSV: Sample, ID, Lane, Read1, [Read2]
+// Parameters
+params.samples = null          // TSV: Sample, ID, Lane, Read1, Read2
 params.outdir = "results"
 params.kmer_length = 31
 params.kmc_ci = 2              // KMC count threshold for canonical run
-params.mac = 5                 // Minor allele count
-params.min_strand_pct = 0.2    // Minimum strand representation percentage
-params.maf = 0.05              // Minor allele frequency for kinship
+params.mac = 2           // Minor allele count - k-mer must appear in at least 5 samples
+params.min_strand_pct = 0.2  // 20% - k-mer must appear in each strand form in 20% of samples where it's found
+params.maf = 0.05        // Minor allele frequency for kinship calculation
 params.help = false
+params.phenotype = null              // Phenotype file (required for GWAS)
+params.gwas_permutations = 100       // Number of permutations for threshold
+params.gwas_maf = 0.05               // MAF for GWAS
+params.gwas_mac = 5                  // MAC for GWAS
+params.gwas_n_kmers = 10000000       // Number of k-mers to filter in first step
+params.gwas_pattern_counter = false  // Count unique k-mer patterns
+params.gwas_remove_intermediates = true  // Clean up intermediate files
+params.gemma_path = "gemma"          // Path to GEMMA executable
+params.run_gwas = false              // Set to true to run GWAS
 
-// GWAS parameters
-params.phenotype = null
-params.gwas_permutations = 100
-params.gwas_maf = 0.05
-params.gwas_mac = 5
-params.gwas_n_kmers = 10000000
-params.gwas_pattern_counter = false
-params.gwas_remove_intermediates = true
-params.gemma_path = "gemma"
-params.run_gwas = false
+// if you already ran everything and now just want to run the GWAS
+params.precomputed_kmers_table = null   // Path to existing kmers_table (without .table extension)
+params.precomputed_kinship = null       // Path to existing kinship matrix
+params.skip_kmer_counting = false       // Skip all k-mer counting steps
 
-// Pre-computed data parameters
-params.precomputed_kmers_table = null
-params.precomputed_kinship = null
-params.skip_kmer_counting = false
-
-// Container
 params.kmersgwas_container = 'docker://bmansfeld/kmersgwas:v0.2-beta'
-
-// ========================================================================================
-// HELP MESSAGE
-// ========================================================================================
 
 if (params.help) {
     println """
-    =========================================
-    K-MERS GWAS PIPELINE
-    =========================================
+    Usage: nextflow run kmers_gwas.nf --samples samples.tsv --outdir results
     
     Required:
-      --samples       TSV with columns: Sample, ID, Lane, Read1, [Read2]
-                      Read2 column optional for single-end reads
+      --samples       TSV with columns: Sample, ID, Lane, Read1, Read2
     
     Optional:
       --outdir        Output directory (default: results)
       --kmer_length   K-mer length (default: 31, max: 31)
-      --kmc_ci        KMC count threshold (default: 2)
-      --mac           Minor allele count (default: 5)
-      --maf           Minor allele frequency for kinship (default: 0.05)
-      
-    Pre-computed data (skip k-mer counting):
-      --precomputed_kmers_table   Path to existing kmers_table (no extension)
-      --precomputed_kinship       Path to existing kinship matrix
-      
-    GWAS:
-      --run_gwas      Set to true to run GWAS (default: false)
-      --phenotype     Path to phenotype file (required for GWAS)
-      
-    Examples:
-      # Paired-end reads - full pipeline
-      nextflow run kmers_gwas.nf --samples samples_pe.tsv --outdir results
-      
-      # Single-end reads - full pipeline  
-      nextflow run kmers_gwas.nf --samples samples_se.tsv --outdir results
-      
-      # GWAS only (pre-computed tables)
-      nextflow run kmers_gwas.nf \\
-        --precomputed_kmers_table results/06_kmers_table/kmers_table \\
-        --precomputed_kinship results/07_kinship/kmers_table.kinship \\
-        --phenotype phenotype.tsv \\
-        --run_gwas true \\
-        --outdir results_gwas
-    
+      --kmc_ci        KMC count threshold for canonical (default: 2)
     """.stripIndent()
     exit 0
 }
 
-if (!params.samples && !params.precomputed_kmers_table) {
-    error "ERROR: Either --samples or --precomputed_kmers_table is required"
-}
+if (!params.samples) error "ERROR: --samples is required"
 
-// ========================================================================================
-// PROCESSES
-// ========================================================================================
-
-/*
- * Process 1: Merge lanes per sample (handles both PE and SE)
- */
+// Process 1: Merge lanes per sample
 process MERGE_LANES {
     tag "${sample}"
     publishDir "${params.outdir}/00_merged/${sample}", mode: 'copy', pattern: "*.txt"
     
-    cpus 2
-    memory 8.GB
+    cpus 1
+    memory 4.GB
     time 4.h
     
     input:
-    tuple val(sample), path(read1_files), path(read2_files), val(seq_type)
+    tuple val(sample), path(read1_files), path(read2_files)
     
     output:
-    tuple val(sample), path("${sample}_R1.merged.fastq.gz"), path("${sample}_R2.merged.fastq.gz"), val(seq_type), emit: reads
+    tuple val(sample), path("${sample}_R1.merged.fastq.gz"), path("${sample}_R2.merged.fastq.gz"), emit: reads
     path "${sample}_merge_info.txt"
     
     script:
-    if (seq_type == 'PE') {
-        """
-        # Merge R1 files
-        cat ${read1_files.join(' ')} > ${sample}_R1.merged.fastq.gz
-        
-        # Merge R2 files
-        cat ${read2_files.join(' ')} > ${sample}_R2.merged.fastq.gz
-        
-        # Record what was merged
-        echo "Sample: ${sample}" > ${sample}_merge_info.txt
-        echo "Type: Paired-End" >> ${sample}_merge_info.txt
-        echo "R1 files merged:" >> ${sample}_merge_info.txt
-        echo "${read1_files.join('\n')}" >> ${sample}_merge_info.txt
-        echo "" >> ${sample}_merge_info.txt
-        echo "R2 files merged:" >> ${sample}_merge_info.txt
-        echo "${read2_files.join('\n')}" >> ${sample}_merge_info.txt
-        """
-    } else {
-        """
-        # Merge R1 files only (SE)
-        cat ${read1_files.join(' ')} > ${sample}_R1.merged.fastq.gz
-        
-        # Create empty R2 file (placeholder for consistency)
-        touch ${sample}_R2.merged.fastq.gz
-        
-        # Record what was merged
-        echo "Sample: ${sample}" > ${sample}_merge_info.txt
-        echo "Type: Single-End" >> ${sample}_merge_info.txt
-        echo "Files merged:" >> ${sample}_merge_info.txt
-        echo "${read1_files.join('\n')}" >> ${sample}_merge_info.txt
-        """
-    }
+    """
+    # Merge R1 files
+    cat ${read1_files.join(' ')} > ${sample}_R1.merged.fastq.gz
+    
+    # Merge R2 files
+    cat ${read2_files.join(' ')} > ${sample}_R2.merged.fastq.gz
+    
+    # Record what was merged
+    echo "Sample: ${sample}" > ${sample}_merge_info.txt
+    echo "R1 files merged:" >> ${sample}_merge_info.txt
+    echo "${read1_files.join('\n')}" >> ${sample}_merge_info.txt
+    echo "" >> ${sample}_merge_info.txt
+    echo "R2 files merged:" >> ${sample}_merge_info.txt
+    echo "${read2_files.join('\n')}" >> ${sample}_merge_info.txt
+    """
 }
 
-/*
- * Process 2: QC with fastp (handles both PE and SE)
- */
+// Process 2: QC with fastp
 process FASTP_QC {
     tag "${sample}"
     publishDir "${params.outdir}/01_fastp/${sample}", mode: 'copy'
@@ -168,7 +95,7 @@ process FASTP_QC {
     time 8.h
     
     input:
-    tuple val(sample), path(read1), path(read2), val(seq_type)
+    tuple val(sample), path(read1), path(read2)
     
     output:
     tuple val(sample), path("${sample}_R1.trimmed.fastq.gz"), path("${sample}_R2.trimmed.fastq.gz"), emit: reads
@@ -176,40 +103,22 @@ process FASTP_QC {
     path "${sample}_fastp.html"
     
     script:
-    if (seq_type == 'PE') {
-        """
-        fastp \
-            -i ${read1} \
-            -I ${read2} \
-            -o ${sample}_R1.trimmed.fastq.gz \
-            -O ${sample}_R2.trimmed.fastq.gz \
-            --json ${sample}_fastp.json \
-            --html ${sample}_fastp.html \
-            --thread ${task.cpus} \
-            --detect_adapter_for_pe \
-            --qualified_quality_phred 20 \
-            --length_required 50
-        """
-    } else {
-        """
-        fastp \
-            -i ${read1} \
-            -o ${sample}_R1.trimmed.fastq.gz \
-            --json ${sample}_fastp.json \
-            --html ${sample}_fastp.html \
-            --thread ${task.cpus} \
-            --qualified_quality_phred 20 \
-            --length_required 50
-        
-        # Create empty R2 for consistency with downstream processes
-        touch ${sample}_R2.trimmed.fastq.gz
-        """
-    }
+    """
+    fastp \
+        -i ${read1} \
+        -I ${read2} \
+        -o ${sample}_R1.trimmed.fastq.gz \
+        -O ${sample}_R2.trimmed.fastq.gz \
+        --json ${sample}_fastp.json \
+        --html ${sample}_fastp.html \
+        --thread ${task.cpus} \
+        --detect_adapter_for_pe \
+        --qualified_quality_phred 20 \
+        --length_required 50
+    """
 }
 
-/*
- * Process 3: KMC canonical count (with canonization)
- */
+// Process 3: KMC canonical count (with canonization)
 process KMC_CANON {
     tag "${sample}"
     publishDir "${params.outdir}/02_kmc/${sample}", mode: 'copy', pattern: "*.{1,2}"
@@ -229,11 +138,9 @@ process KMC_CANON {
     
     script:
     """
-    # Create input file list (only add R2 if it's not empty)
+    # Create input file list
     echo "${read1}" > input_files.txt
-    if [ -s ${read2} ]; then
-        echo "${read2}" >> input_files.txt
-    fi
+    echo "${read2}" >> input_files.txt
     
     # Run KMC with canonization
     kmc -t${task.cpus} \
@@ -246,9 +153,7 @@ process KMC_CANON {
     """
 }
 
-/*
- * Process 4: KMC all k-mers count (no canonization)
- */
+// Process 4: KMC all k-mers count (no canonization)
 process KMC_ALL {
     tag "${sample}"
     publishDir "${params.outdir}/02_kmc/${sample}", mode: 'copy', pattern: "*.{1,2}"
@@ -268,11 +173,9 @@ process KMC_ALL {
     
     script:
     """
-    # Create input file list (only add R2 if it's not empty)
+    # Create input file list
     echo "${read1}" > input_files.txt
-    if [ -s ${read2} ]; then
-        echo "${read2}" >> input_files.txt
-    fi
+    echo "${read2}" >> input_files.txt
     
     # Run KMC without canonization
     kmc -t${task.cpus} \
@@ -286,14 +189,13 @@ process KMC_ALL {
     """
 }
 
-/*
- * Process 5: Combine strand information
- */
+// Process 5: Combine strand information (UPDATED - now captures log)
 process COMBINE_STRAND_INFO {
     tag "${sample}"
     publishDir "${params.outdir}/03_kmers_strand/${sample}", mode: 'copy'
     container params.kmersgwas_container
     
+       
     cpus 2
     memory 8.GB
     time 4.h
@@ -320,9 +222,7 @@ process COMBINE_STRAND_INFO {
     """
 }
 
-/*
- * Process 6: Summarize QC stats from ALL samples into ONE file
- */
+// Process 6: Summarize QC stats from ALL samples into ONE file
 process SUMMARIZE_QC {
     publishDir "${params.outdir}/04_qc", mode: 'copy'
     
@@ -331,7 +231,7 @@ process SUMMARIZE_QC {
     time 1.h
     
     input:
-    path strand_logs
+    path strand_logs  // This receives ALL logs via .collect()
     
     output:
     path "kmc_qc_summary.tsv"
@@ -355,9 +255,7 @@ process SUMMARIZE_QC {
     """
 }
 
-/*
- * Process 7: List all k-mers found across multiple samples
- */
+// Process 7: List all k-mers found across multiple samples
 process LIST_KMERS_MULTI_SAMPLES {
     publishDir "${params.outdir}/05_kmers_list", mode: 'copy'
     container params.kmersgwas_container
@@ -367,7 +265,7 @@ process LIST_KMERS_MULTI_SAMPLES {
     time 12.h
     
     input:
-    path kmers_files
+    path kmers_files  // All kmers_with_strand files collected
     
     output:
     path "kmers_to_use", emit: kmers_list
@@ -380,6 +278,7 @@ process LIST_KMERS_MULTI_SAMPLES {
     script:
     """
     # Create list of k-mers files with sample names
+    # Format: /path/to/file<TAB>sample_name
     for kmers_file in *_kmers_with_strand; do
         sample=\$(basename \$kmers_file _kmers_with_strand)
         echo -e "\${PWD}/\${kmers_file}\\t\${sample}" >> kmers_list_paths.txt
@@ -395,9 +294,8 @@ process LIST_KMERS_MULTI_SAMPLES {
     """
 }
 
-/*
- * Process 8: Build k-mers presence/absence table
- */
+
+// Process 8: Build k-mers presence/absence table
 process BUILD_KMERS_TABLE {
     publishDir "${params.outdir}/06_kmers_table", mode: 'copy'
     container params.kmersgwas_container
@@ -407,8 +305,8 @@ process BUILD_KMERS_TABLE {
     time 24.h
     
     input:
-    path kmers_files
-    path kmers_to_use
+    path kmers_files      // All kmers_with_strand files
+    path kmers_to_use     // Filtered k-mer list from LIST_KMERS_MULTI_SAMPLES
     
     output:
     path "kmers_table.table", emit: table
@@ -418,6 +316,7 @@ process BUILD_KMERS_TABLE {
     script:
     """
     # Create list of k-mers files with sample names
+    # Format: /path/to/file<TAB>sample_name
     for kmers_file in *_kmers_with_strand; do
         sample=\$(basename \$kmers_file _kmers_with_strand)
         echo -e "\${PWD}/\${kmers_file}\\t\${sample}" >> kmers_list_paths.txt
@@ -432,16 +331,14 @@ process BUILD_KMERS_TABLE {
     """
 }
 
-/*
- * Process 9: Calculate kinship matrix
- */
+// Process 9: Calculate kinship matrix
 process CALCULATE_KINSHIP {
     publishDir "${params.outdir}/07_kinship", mode: 'copy'
     container params.kmersgwas_container
     
     cpus 16
     memory 128.GB
-    time '5.d'
+    time '5.d'  // 5 days - this can be slow for large datasets
     
     input:
     path kmers_table
@@ -452,6 +349,7 @@ process CALCULATE_KINSHIP {
     
     script:
     """
+    # emma_kinship_kmers outputs to stdout, redirect to file
     emma_kinship_kmers \
         -t kmers_table \
         -k ${params.kmer_length} \
@@ -460,9 +358,7 @@ process CALCULATE_KINSHIP {
     """
 }
 
-/*
- * Process 10: Run k-mers GWAS
- */
+// Process 10: Run k-mers GWAS
 process RUN_KMERS_GWAS {
     publishDir "${params.outdir}/08_gwas", mode: 'copy'
     container params.kmersgwas_container
@@ -478,18 +374,21 @@ process RUN_KMERS_GWAS {
     path phenotype
     
     output:
-    path "kmers/output/phenotype_value.assoc.txt.gz", emit: results, optional: true
-    path "kmers/pass_threshold_5per", emit: sig_5per, optional: true
-    path "kmers/pass_threshold_10per", emit: sig_10per, optional: true
-    path "kmers/threshold_5per", emit: thresh_5per, optional: true
-    path "kmers/threshold_10per", emit: thresh_10per, optional: true
-    path "log_file"
-    path "kmers/output/*", optional: true
+    path "gwas_output/kmers/output/phenotype_value.assoc.txt.gz", emit: results
+    path "gwas_output/kmers/pass_threshold_5per", emit: sig_5per, optional: true
+    path "gwas_output/kmers/pass_threshold_10per", emit: sig_10per, optional: true
+    path "gwas_output/kmers/threshold_5per", emit: thresh_5per
+    path "gwas_output/kmers/threshold_10per", emit: thresh_10per
+    path "gwas_output/log_file"
+    path "gwas_output/kmers/output/*", optional: true
     
     script:
     def pattern_flag = params.gwas_pattern_counter ? "--pattern_counter" : ""
     def remove_flag = params.gwas_remove_intermediates ? "" : "--dont_remove_intermediates"
     """
+    # Ensure kinship matrix has the expected name relative to kmers_table
+    cp ${kinship} kmers_table.kinship
+    
     # Get the kmersGWAS installation from the container
     KMERS_GWAS_BASE=\$(dirname \$(which kmers_add_strand_information))/../
     
@@ -499,25 +398,21 @@ process RUN_KMERS_GWAS {
         --kmers_table kmers_table \
         -l ${params.kmer_length} \
         -p ${task.cpus} \
-        --outdir . \
+        --outdir gwas_output \
         --maf ${params.gwas_maf} \
         --mac ${params.gwas_mac} \
         --permutations ${params.gwas_permutations} \
+        --kmers_table kmers_table \
         -k ${params.gwas_n_kmers} \
         --gemma_path ${params.gemma_path} \
         ${pattern_flag} \
         ${remove_flag}
     
     # Ensure output files exist (even if empty)
-    mkdir -p kmers
-    touch kmers/threshold_5per
-    touch kmers/threshold_10per
+    touch gwas_output/kmers/threshold_5per
+    touch gwas_output/kmers/threshold_10per
     """
 }
-
-// ========================================================================================
-// WORKFLOW
-// ========================================================================================
 
 workflow {
     
@@ -526,32 +421,16 @@ workflow {
     // ==============================================================================
     if (!params.skip_kmer_counting && params.precomputed_kmers_table == null) {
         
-        // Read sample sheet and determine if PE or SE
+        // Read sample sheet and group by Sample
         Channel
             .fromPath(params.samples)
             .splitCsv(header: true, sep: '\t')
             .map { row -> 
-                def sample = row.Sample
-                def read1 = file(row.Read1)
-                
-                // Check if Read2 column exists and is not empty (PE vs SE detection)
-                def isPE = row.containsKey('Read2') && row.Read2 && row.Read2.trim() != ''
-                
-                if (isPE) {
-                    def read2 = file(row.Read2)
-                    tuple(sample, read1, read2, 'PE')
-                } else {
-                    tuple(sample, read1, null, 'SE')
-                }
+                tuple(row.Sample, file(row.Read1), file(row.Read2))
             }
-            .groupTuple(by: 0)  // Group by sample
-            .map { sample, read1s, read2s, types ->
-                def isPE = types[0] == 'PE'
-                if (isPE) {
-                    tuple(sample, read1s, read2s, 'PE')
-                } else {
-                    tuple(sample, read1s, [], 'SE')
-                }
+            .groupTuple(by: 0)
+            .map { sample, read1s, read2s ->
+                tuple(sample, read1s, read2s)
             }
             .set { samples_grouped }
         
@@ -561,9 +440,9 @@ workflow {
         // QC merged reads
         FASTP_QC(MERGE_LANES.out.reads)
         
-        // Run both KMC processes in parallel (drop seq_type for KMC)
-        KMC_CANON(FASTP_QC.out.reads.map { sample, r1, r2 -> tuple(sample, r1, r2) })
-        KMC_ALL(FASTP_QC.out.reads.map { sample, r1, r2 -> tuple(sample, r1, r2) })
+        // Run both KMC processes in parallel
+        KMC_CANON(FASTP_QC.out.reads)
+        KMC_ALL(FASTP_QC.out.reads)
         
         // Combine the outputs from both KMC runs
         KMC_CANON.out.kmc_db
@@ -634,23 +513,15 @@ workflow {
     }
 }
 
-// ========================================================================================
-// COMPLETION
-// ========================================================================================
-
 workflow.onComplete {
     println "==================================="
     println "PIPELINE COMPLETE"
     println "Status: ${workflow.success ? 'SUCCESS' : 'FAILED'}"
     println ""
-    if (params.precomputed_kmers_table == null) {
-        println "Outputs:"
-        println "  - K-mers table: ${params.outdir}/06_kmers_table/kmers_table.table"
-        println "  - Sample names: ${params.outdir}/06_kmers_table/kmers_table.names"
-        if (params.precomputed_kinship == null) {
-            println "  - Kinship matrix: ${params.outdir}/07_kinship/kmers_table.kinship"
-        }
-    }
+    println "Outputs:"
+    println "  - K-mers table: ${params.outdir}/06_kmers_table/kmers_table.table"
+    println "  - Sample names: ${params.outdir}/06_kmers_table/kmers_table.names"
+    println "  - Kinship matrix: ${params.outdir}/07_kinship/kmers_table.kinship"
     if (params.run_gwas && params.phenotype != null) {
         println "  - GWAS results: ${params.outdir}/08_gwas/kmers/output/"
         println "  - Significant k-mers (5%): ${params.outdir}/08_gwas/kmers/pass_threshold_5per"
